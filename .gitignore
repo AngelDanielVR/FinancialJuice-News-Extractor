@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Playwright / browser artifacts
+playwright-report/
+test-results/
+.traces/
+trace.zip
+
+# Runtime output
+out/
+output/
+exports/
+tmp/
+temp/
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+
+# Session / auth / local browser state
+storage_state.json
+auth.json
+user_data/
+profile/
+browser-profile/
+
+# Jupyter
+.ipynb_checkpoints/
