@@ -10,6 +10,17 @@ dist/
 *.egg-info/
 pip-wheel-metadata/
 
+# Development
+Dev/exe_files/
+__pycache__/
+Resources/
+Dev/Repository/
+Dev/Backup/
+Tools/SVN/
+Results/
+Tests/
+*.gpg
+
 # Virtual environments
 .venv/
 venv/
