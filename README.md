@@ -215,3 +215,11 @@ python financialjuice_extractor.py --headed --manual-login --debug --hours 24 --
 * This extractor is intended for dynamic rendered content, not static HTML snapshots.
 * A persistent browser profile is often the most reliable setup for repeated authenticated runs.
 * `news.jsonl` is the preferred export for downstream LLM workflows.
+
+### Example Prompt for Analysis:
+
+```bash
+Analyze the attached FinancialJuice news dataset exhaustively.
+Use each item as a separate news event.
+Build a chronological timeline, cluster themes, identify market impacts by asset class, detect narrative shifts, contradictions, and follow-up developments, and separate facts from interpretation.
+```
