@@ -219,7 +219,7 @@ python financialjuice_extractor.py --headed --manual-login --debug --hours 24 --
 ### Example Prompt for Analysis:
 
 ```bash
-Analyze the attached FinancialJuice news dataset exhaustively.
+Analyze the attached FinancialJuice news dataset exhaustively. Cross-reference and verify the information for consistency, and provide the final response entirely in Spanish.
 Use each item as a separate news event.
 Build a chronological timeline, cluster themes, identify market impacts by asset class, detect narrative shifts, contradictions, and follow-up developments, and separate facts from interpretation.
 ```
