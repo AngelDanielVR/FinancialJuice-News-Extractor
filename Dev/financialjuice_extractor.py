@@ -1,475 +1,842 @@
-#!/usr/bin/env python3
 """
-FinancialJuice news extractor.
+financialjuice_extractor.py
 
-Goal:
-- Log into FinancialJuice (optionally via env vars or existing browser session)
-- Load the main news feed
-- Scroll backwards until at least N hours of history are collected
-- Extract each visible news item into structured JSON
-- Emit outputs that are convenient to attach to another AI:
-  * news.jsonl  -> one JSON object per line
-  * news.json   -> full array
-  * news.md     -> LLM-friendly markdown bundle
-  * summary.json -> metadata about the run
+Robust FinancialJuice feed extractor using Playwright.
 
-Notes:
-- This script intentionally scrapes the rendered DOM instead of hard-coding private API
-  endpoints. The provided HTML indicates the page hydrates #mainFeed dynamically and the
-  PDF shows the delayed feed entries rendered in-page, so DOM extraction is the most
-  resilient approach.
-- Default behavior targets 24h of history from the newest collected item.
+Key design choices:
+- Uses a real browser session (Playwright) because the feed is rendered dynamically.
+- Supports login via environment variables, manual login, or a persistent browser profile.
+- Waits for any likely feed container to contain rendered text, not just #mainFeed.
+- Scrolls until feed growth stabilizes.
+- Extracts candidate blocks using timestamp-based heuristics instead of brittle CSS classes.
+- Filters to at least N hours from the latest extracted item.
+- Exports JSONL / JSON / Markdown / summary.
 
-Install:
+Typical usage:
     pip install playwright python-dateutil
     playwright install chromium
 
-Usage examples:
-    python financialjuice_extractor.py \
-        --email "$FJ_EMAIL" --password "$FJ_PASSWORD" \
-        --hours 24 --out-dir out
+    export FJ_EMAIL="your_email"
+    export FJ_PASSWORD="your_password"
 
-    # Reuse an already logged-in profile for MFA / captcha resistant runs
-    python financialjuice_extractor.py \
-        --user-data-dir /path/to/chrome-profile \
-        --profile-directory Default \
-        --hours 24 --headed
+    python financialjuice_extractor.py --hours 24 --out-dir out
 
-Environment variables:
-    FJ_EMAIL, FJ_PASSWORD
+Manual login mode:
+    python financialjuice_extractor.py --manual-login --headed --hours 24 --out-dir out
+
+Persistent browser profile:
+    python financialjuice_extractor.py --headed --user-data-dir ./user_data --hours 24 --out-dir out
 """
+
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
-import sys
-import time
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from dateutil import parser as dtparser
-from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeoutError, sync_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 BASE_URL = "https://www.financialjuice.com/home"
-TIMESTAMP_RE = re.compile(r"^(?P<hour>\d{1,2}):(\d{2})\s+(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})$")
-MONTHS = {m: i for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
-JUNK_PATTERNS = [
-    re.compile(r"^Join us and Go Real-time", re.I),
-    re.compile(r"^Don't like Ads\? GO PRO", re.I),
-    re.compile(r"^THIS FEED IS DELAYED", re.I),
-    re.compile(r"^GO REAL-TIME$", re.I),
+
+TIME_RE = re.compile(r"\b(?P<hour>\d{1,2}):(?P<minute>\d{2})\s+(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\b")
+URL_RE = re.compile(r"https?://\S+")
+WHITESPACE_RE = re.compile(r"[ \t]+")
+MULTI_NL_RE = re.compile(r"\n{3,}")
+
+BAD_BLOCK_PATTERNS = [
+    re.compile(r"\bjoin us\b", re.I),
+    re.compile(r"\bgo real[- ]?time\b", re.I),
+    re.compile(r"\bdon't like ads\b", re.I),
+    re.compile(r"\bgo pro\b", re.I),
+    re.compile(r"\bdiscord\b", re.I),
+    re.compile(r"\btrack all markets on tradingview\b", re.I),
+    re.compile(r"\bvoice news\b", re.I),
+    re.compile(r"\bneed to know market risk\b", re.I),
 ]
-TAG_TOKENS = {
-    "Energy", "US", "Bonds", "Indexes", "USD", "Macro", "Forex", "Crypto",
-    "Equities", "Commodities", "Market", "Moving", "Elite", "Risk"
+
+MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
 }
 
 
 @dataclass
 class NewsItem:
-    source_order: int
     headline: str
     body: Optional[str]
-    timestamp_raw: str
-    timestamp_iso: str
-    age_hours_from_latest: float
+    timestamp_text: str
+    timestamp_iso: Optional[str]
     tags: List[str]
-    url: Optional[str]
-    feed: str = "mainfeed"
+    urls: List[str]
+    source_block_tag: Optional[str] = None
+    source_block_class: Optional[str] = None
+    raw_text: Optional[str] = None
+    age_from_latest_minutes: Optional[int] = None
 
 
-JS_EXTRACT = r"""
-() => {
-  const root = document.querySelector('#mainFeed');
-  if (!root) {
-    return {error: 'mainFeed not found'};
-  }
-
-  function isVisible(el) {
-    const s = window.getComputedStyle(el);
-    const r = el.getBoundingClientRect();
-    return s && s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0 && r.width > 0;
-  }
-
-  function textOf(el) {
-    return (el?.innerText || el?.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-  }
-
-  function absUrl(href) {
-    try { return href ? new URL(href, location.href).href : null; } catch (e) { return href || null; }
-  }
-
-  const all = Array.from(root.querySelectorAll('*')).filter(isVisible);
-  const candidates = [];
-
-  for (const el of all) {
-    const text = textOf(el);
-    if (!text || text.length < 20 || text.length > 1500) continue;
-
-    const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
-    if (lines.length === 0) continue;
-
-    const hasTime = lines.some(line => /^\d{1,2}:\d{2}\s+[A-Za-z]{3}\s+\d{1,2}$/.test(line));
-    if (!hasTime) continue;
-
-    const anchors = Array.from(el.querySelectorAll('a[href]')).map(a => absUrl(a.getAttribute('href'))).filter(Boolean);
-    candidates.push({
-      html_len: el.outerHTML.length,
-      text,
-      lines,
-      urls: [...new Set(anchors)],
-      tag: el.tagName,
-      cls: el.className || ''
-    });
-  }
-
-  candidates.sort((a, b) => a.html_len - b.html_len);
-
-  const unique = [];
-  const seen = new Set();
-  for (const c of candidates) {
-    const key = c.text;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(c);
-  }
-
-  return {items: unique};
-}
-"""
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract FinancialJuice news items from the rendered feed")
-    p.add_argument("--email", default=os.getenv("FJ_EMAIL"))
-    p.add_argument("--password", default=os.getenv("FJ_PASSWORD"))
-    p.add_argument("--hours", type=float, default=24.0, help="minimum history depth from newest item")
-    p.add_argument("--out-dir", default="financialjuice_output")
-    p.add_argument("--headed", action="store_true", help="show browser window")
-    p.add_argument("--timeout-ms", type=int, default=30000)
-    p.add_argument("--max-scrolls", type=int, default=250)
-    p.add_argument("--scroll-pause", type=float, default=1.0)
-    p.add_argument("--user-data-dir", help="reuse an existing Chrome/Chromium profile")
-    p.add_argument("--profile-directory", default=None, help="Chrome profile directory name, e.g. Default")
-    p.add_argument("--manual-login", action="store_true", help="pause for manual login instead of submitting credentials")
-    return p.parse_args()
+def normalize_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [WHITESPACE_RE.sub(" ", ln).strip() for ln in text.split("\n")]
+    text = "\n".join(lines)
+    text = MULTI_NL_RE.sub("\n\n", text)
+    return text.strip()
 
 
-def create_context(playwright, args: argparse.Namespace) -> BrowserContext:
-    if args.user_data_dir:
-        launch_args = {
-            "headless": not args.headed,
-            "channel": "chrome" if sys.platform != "linux" else None,
-        }
-        if args.profile_directory:
-            launch_args["args"] = [f"--profile-directory={args.profile_directory}"]
-        launch_args = {k: v for k, v in launch_args.items() if v is not None}
-        return playwright.chromium.launch_persistent_context(args.user_data_dir, **launch_args)
-
-    browser = playwright.chromium.launch(headless=not args.headed)
-    return browser.new_context()
+def text_looks_like_noise(text: str) -> bool:
+    if len(text) < 20:
+        return True
+    return any(rx.search(text) for rx in BAD_BLOCK_PATTERNS)
 
 
-def maybe_login(page: Page, args: argparse.Namespace) -> None:
-    page.goto(BASE_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(2500)
+def parse_timestamp_text(ts_text: str, now: Optional[datetime] = None) -> Optional[datetime]:
+    """
+    Parse timestamps like: '17:51 Apr 18'
+    Infer year by choosing the closest plausible year to 'now'.
+    """
+    now = now or datetime.now()
+    m = TIME_RE.search(ts_text)
+    if not m:
+        return None
 
-    if page.locator("text=Hello,").count() > 0:
-        return
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute"))
+    mon = MONTHS.get(m.group("mon"))
+    day = int(m.group("day"))
 
-    if args.manual_login:
-        print("Please log in manually in the opened browser, then press Enter here...", flush=True)
-        input()
-        page.goto(BASE_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
-        return
+    if mon is None:
+        return None
 
-    if not args.email or not args.password:
-        raise RuntimeError(
-            "Not logged in and no credentials supplied. Use --manual-login, --user-data-dir, or set FJ_EMAIL/FJ_PASSWORD."
-        )
-
-    # Open the sign-in modal if present.
-    for selector in ["text=Login", "text=Sign In", "#signup", "#LoginTab"]:
+    candidates: List[datetime] = []
+    for year in (now.year - 1, now.year, now.year + 1):
         try:
-            if page.locator(selector).count() > 0:
-                page.locator(selector).first.click(timeout=2000)
-                page.wait_for_timeout(1000)
+            candidates.append(datetime(year, mon, day, hour, minute))
+        except ValueError:
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda dt: abs((dt - now).total_seconds()))
+    chosen = candidates[0]
+
+    if chosen - now > timedelta(days=2):
+        for cand in candidates:
+            if cand <= now + timedelta(days=2):
+                chosen = cand
+                break
+
+    return chosen
+
+
+def split_headline_body(before_ts: str) -> Tuple[Optional[str], Optional[str]]:
+    lines = [ln.strip() for ln in before_ts.split("\n") if ln.strip()]
+    if not lines:
+        return None, None
+
+    headline = lines[0]
+    body = "\n".join(lines[1:]).strip() or None
+    return headline, body
+
+
+def parse_tags(after_ts: str) -> List[str]:
+    after_ts = after_ts.strip()
+    if not after_ts:
+        return []
+
+    tokens = [tok.strip(" ,|") for tok in after_ts.split() if tok.strip(" ,|")]
+    if not tokens:
+        return []
+
+    if len(tokens) > 16:
+        return []
+
+    clean: List[str] = []
+    for tok in tokens:
+        if len(tok) > 30:
+            continue
+        if URL_RE.search(tok):
+            continue
+        clean.append(tok)
+
+    return clean
+
+
+def parse_block_text(block_text: str, now: Optional[datetime] = None) -> Optional[NewsItem]:
+    text = normalize_text(block_text)
+    if text_looks_like_noise(text):
+        return None
+
+    m = TIME_RE.search(text)
+    if not m:
+        return None
+
+    ts_text = m.group(0)
+    before = text[:m.start()].strip()
+    after = text[m.end():].strip()
+
+    if not before:
+        return None
+
+    headline, body = split_headline_body(before)
+    if not headline:
+        return None
+
+    if text_looks_like_noise(headline):
+        return None
+
+    dt = parse_timestamp_text(ts_text, now=now)
+    urls = URL_RE.findall(text)
+    tags = parse_tags(after)
+
+    return NewsItem(
+        headline=headline,
+        body=body,
+        timestamp_text=ts_text,
+        timestamp_iso=dt.isoformat() if dt else None,
+        tags=tags,
+        urls=urls,
+        raw_text=text,
+    )
+
+
+def dedupe_items(items: List[NewsItem]) -> List[NewsItem]:
+    seen = set()
+    deduped: List[NewsItem] = []
+
+    for item in items:
+        key = (
+            item.headline.strip().lower(),
+            item.timestamp_text.strip().lower(),
+            (item.body or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    return deduped
+
+
+def sort_items_desc(items: List[NewsItem]) -> List[NewsItem]:
+    def key(item: NewsItem) -> Tuple[int, str]:
+        if item.timestamp_iso:
+            return (1, item.timestamp_iso)
+        return (0, item.timestamp_text)
+
+    return sorted(items, key=key, reverse=True)
+
+
+def filter_items_by_hours_from_latest(items: List[NewsItem], hours: int) -> List[NewsItem]:
+    if not items:
+        return items
+
+    items = sort_items_desc(items)
+    valid = [x for x in items if x.timestamp_iso]
+    if not valid:
+        return items
+
+    latest = datetime.fromisoformat(valid[0].timestamp_iso)
+    cutoff = latest - timedelta(hours=hours)
+
+    filtered: List[NewsItem] = []
+    for item in items:
+        if not item.timestamp_iso:
+            continue
+        dt = datetime.fromisoformat(item.timestamp_iso)
+        if dt >= cutoff:
+            item.age_from_latest_minutes = int((latest - dt).total_seconds() // 60)
+            filtered.append(item)
+
+    return filtered
+
+
+def build_markdown(items: List[NewsItem], hours: int) -> str:
+    lines: List[str] = []
+    lines.append(f"# FinancialJuice News Export ({hours}h window)")
+    lines.append("")
+    lines.append(f"Total items: **{len(items)}**")
+    lines.append("")
+
+    for idx, item in enumerate(items, start=1):
+        lines.append(f"## {idx}. {item.headline}")
+        lines.append("")
+        lines.append(f"- Timestamp: `{item.timestamp_text}`")
+        if item.timestamp_iso:
+            lines.append(f"- ISO time: `{item.timestamp_iso}`")
+        if item.age_from_latest_minutes is not None:
+            lines.append(f"- Age from latest: `{item.age_from_latest_minutes} min`")
+        if item.tags:
+            lines.append(f"- Tags: {', '.join(item.tags)}")
+        if item.urls:
+            lines.append(f"- URLs: {', '.join(item.urls)}")
+        lines.append("")
+        if item.body:
+            lines.append(item.body)
+            lines.append("")
+        lines.append("```text")
+        lines.append(item.raw_text or "")
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_outputs(items: List[NewsItem], out_dir: Path, hours: int) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    jsonl_path = out_dir / "news.jsonl"
+    json_path = out_dir / "news.json"
+    md_path = out_dir / "news.md"
+    summary_path = out_dir / "summary.json"
+
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(asdict(item), ensure_ascii=False) + "\n")
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump([asdict(x) for x in items], f, ensure_ascii=False, indent=2)
+
+    md_path.write_text(build_markdown(items, hours=hours), encoding="utf-8")
+
+    latest_iso = items[0].timestamp_iso if items else None
+    earliest_iso = items[-1].timestamp_iso if items else None
+
+    summary = {
+        "exported_items": len(items),
+        "window_hours": hours,
+        "latest_timestamp_iso": latest_iso,
+        "earliest_timestamp_iso": earliest_iso,
+        "generated_at_iso": datetime.utcnow().isoformat() + "Z",
+        "files": {
+            "jsonl": str(jsonl_path),
+            "json": str(json_path),
+            "markdown": str(md_path),
+        },
+    }
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    log(f"[ok] wrote {jsonl_path}")
+    log(f"[ok] wrote {json_path}")
+    log(f"[ok] wrote {md_path}")
+    log(f"[ok] wrote {summary_path}")
+
+
+async def screenshot_debug(page: Page, out_dir: Path, name: str) -> None:
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{name}.png"
+        await page.screenshot(path=str(path), full_page=True)
+        log(f"[debug] screenshot: {path}")
+    except Exception as exc:
+        log(f"[debug] screenshot failed: {exc}")
+
+
+def selector_to_filename_part(selector: str) -> str:
+    return (
+        selector.replace("#", "id_")
+        .replace(".", "class_")
+        .replace("*", "all")
+        .replace("/", "_")
+        .replace(" ", "_")
+        .replace("[", "_")
+        .replace("]", "_")
+        .replace("'", "")
+        .replace('"', "")
+        .replace("=", "_")
+    )
+
+
+async def dump_mainfeed_debug(page: Page, out_dir: Path) -> None:
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        selectors = [
+            "#mainFeed",
+            ".infinite-container",
+            ".waypoint",
+            "main",
+            "body",
+        ]
+
+        debug_report = []
+
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                count = await loc.count()
+                if count == 0:
+                    debug_report.append(f"=== SELECTOR: {sel} ===\nNOT FOUND\n\n")
+                    continue
+
+                txt = await loc.inner_text(timeout=1500)
+                html = await loc.evaluate("el => el.outerHTML")
+
+                txt = normalize_text(txt)
+                base = selector_to_filename_part(sel)
+
+                (out_dir / f"debug_{base}.txt").write_text(txt, encoding="utf-8")
+                (out_dir / f"debug_{base}.html").write_text(html, encoding="utf-8")
+
+                debug_report.append(
+                    f"=== SELECTOR: {sel} ===\n"
+                    f"text_len={len(txt)}\n"
+                    f"preview:\n{txt[:2000]}\n\n"
+                )
+            except Exception as exc:
+                debug_report.append(f"=== SELECTOR: {sel} ===\nERROR: {exc}\n\n")
+
+        (out_dir / "debug_selector_report.txt").write_text("".join(debug_report), encoding="utf-8")
+        log(f"[debug] wrote {out_dir / 'debug_selector_report.txt'}")
+
+    except Exception as exc:
+        log(f"[debug] feed dump failed: {exc}")
+
+
+async def create_context(
+    pw,
+    headed: bool,
+    user_data_dir: Optional[str],
+) -> Tuple[BrowserContext, Optional[Any]]:
+    if user_data_dir:
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=not headed,
+            viewport={"width": 1440, "height": 1100},
+        )
+        return context, None
+
+    browser = await pw.chromium.launch(headless=not headed)
+    context = await browser.new_context(viewport={"width": 1440, "height": 1100})
+    return context, browser
+
+
+async def dismiss_cookie_or_modal_noise(page: Page) -> None:
+    selectors = [
+        "button:has-text('Accept')",
+        "button:has-text('I Agree')",
+        "button:has-text('Got it')",
+        ".modal .close",
+        ".btn-close",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=600):
+                await loc.click(timeout=600)
+                await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+
+async def maybe_login(page: Page, email: Optional[str], password: Optional[str], manual_login: bool) -> None:
+    await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2000)
+    await dismiss_cookie_or_modal_noise(page)
+
+    if manual_login:
+        log("[info] manual login mode enabled.")
+        log("[info] log in in the opened browser, then press Enter here to continue...")
+        await asyncio.to_thread(input)
+        await page.wait_for_load_state("domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
+        return
+
+    try:
+        hello = page.locator("text=Hello,").first
+        if await hello.is_visible(timeout=1500):
+            log("[info] already logged in.")
+            return
+    except Exception:
+        pass
+
+    if not email or not password:
+        log("[warn] FJ_EMAIL / FJ_PASSWORD not provided. Proceeding without scripted login.")
+        return
+
+    tried_modal = False
+    candidate_buttons = [
+        "text=Login",
+        "text=Sign In",
+        "#liSignIn",
+        "a[href*='login']",
+    ]
+    for sel in candidate_buttons:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=1200):
+                await loc.click(timeout=1500)
+                tried_modal = True
+                await page.wait_for_timeout(1200)
                 break
         except Exception:
             pass
 
-    page.locator("#ctl00_SignInSignUp_loginForm1_inputEmail").fill(args.email)
-    page.locator("#ctl00_SignInSignUp_loginForm1_inputPassword").fill(args.password)
-    page.locator("#ctl00_SignInSignUp_loginForm1_btnLogin").click()
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(4000)
+    if tried_modal:
+        try:
+            sign_in_tab = page.locator("#liSignIn").first
+            if await sign_in_tab.is_visible(timeout=1000):
+                await sign_in_tab.click(timeout=1500)
+                await page.wait_for_timeout(800)
+        except Exception:
+            pass
 
-    if page.locator("text=Hello,").count() == 0:
-        raise RuntimeError("Login did not appear to succeed. Try --headed --manual-login or a persistent profile.")
+    email_selectors = [
+        "#ctl00_SignInSignUp_loginForm1_inputEmail",
+        "input[type='email']",
+    ]
+    pass_selectors = [
+        "#ctl00_SignInSignUp_loginForm1_inputPassword",
+        "input[type='password']",
+    ]
+    submit_selectors = [
+        "#ctl00_SignInSignUp_loginForm1_btnLogin",
+        "input[type='submit'][value='Login']",
+        "button:has-text('Login')",
+    ]
 
+    email_filled = False
+    for sel in email_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=1500):
+                await loc.fill(email, timeout=3000)
+                email_filled = True
+                break
+        except Exception:
+            pass
 
-def wait_for_feed(page: Page, timeout_ms: int) -> None:
-    page.goto(BASE_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(3000)
-    page.wait_for_function(
-        """
-        () => {
-          const root = document.querySelector('#mainFeed');
-          return !!root;
-        }
-        """,
-        timeout=timeout_ms,
-    )
-    # Give the dynamic feed a moment to populate.
-    page.wait_for_timeout(5000)
+    pass_filled = False
+    for sel in pass_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=1500):
+                await loc.fill(password, timeout=3000)
+                pass_filled = True
+                break
+        except Exception:
+            pass
 
+    if email_filled and pass_filled:
+        submitted = False
+        for sel in submit_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=1200):
+                    await loc.click(timeout=3000)
+                    submitted = True
+                    break
+            except Exception:
+                pass
 
-def clean_text(text: Optional[str]) -> Optional[str]:
-    if text is None:
-        return None
-    t = re.sub(r"\s+", " ", text.replace("\u00a0", " ")).strip()
-    if not t:
-        return None
-    for pat in JUNK_PATTERNS:
-        if pat.search(t):
-            return None
-    return t
+        if submitted:
+            await page.wait_for_load_state("domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(4000)
 
+    await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(3000)
+    await dismiss_cookie_or_modal_noise(page)
 
-def parse_timestamp(raw: str, now: Optional[datetime] = None) -> datetime:
-    now = now or datetime.now()
-    m = TIMESTAMP_RE.match(raw.strip())
-    if not m:
-        return dtparser.parse(raw)
-    hour_min = raw.split()[0]
-    hour, minute = map(int, hour_min.split(":"))
-    mon = MONTHS[m.group("mon")]
-    day = int(m.group("day"))
-    year = now.year
-    dt = datetime(year, mon, day, hour, minute)
-    # Handle year rollover near January.
-    if dt > now + timedelta(days=2):
-        dt = dt.replace(year=year - 1)
-    return dt
-
-
-def looks_like_tag_line(line: str) -> bool:
-    toks = line.split()
-    if not toks or len(toks) > 8:
-        return False
-    if sum(1 for tok in toks if tok in TAG_TOKENS or tok.isupper()) >= max(1, len(toks) - 1):
-        return True
-    return False
-
-
-def candidate_to_item(c: dict, order_idx: int, latest_dt: Optional[datetime]) -> Optional[NewsItem]:
-    lines = [clean_text(x) for x in c["lines"]]
-    lines = [x for x in lines if x]
-    if not lines:
-        return None
-
-    ts_idx = None
-    for i, line in enumerate(lines):
-        if TIMESTAMP_RE.match(line):
-            ts_idx = i
-            break
-    if ts_idx is None:
-        return None
-
-    headline_lines = [ln for ln in lines[:ts_idx] if not looks_like_tag_line(ln)]
-    if not headline_lines:
-        return None
-    headline = clean_text(" ".join(headline_lines))
-    if not headline:
-        return None
-
-    after = [ln for ln in lines[ts_idx + 1:] if ln]
-    tags = []
-    body_lines = []
-    for ln in after:
-        if looks_like_tag_line(ln):
-            tags.extend(ln.split())
+    try:
+        hello = page.locator("text=Hello,").first
+        if await hello.is_visible(timeout=2000):
+            log("[info] login appears successful.")
         else:
-            body_lines.append(ln)
+            log("[warn] login could not be confirmed. Continuing anyway.")
+    except Exception:
+        log("[warn] login could not be confirmed. Continuing anyway.")
 
-    # Remove headline duplicated as first body line.
-    if body_lines and body_lines[0] == headline:
-        body_lines = body_lines[1:]
 
-    body = clean_text(" ".join(body_lines))
-    url = None
-    for u in c.get("urls", []):
-        if "/News/" in u or u.endswith(".aspx"):
-            url = u
-            break
+async def wait_for_mainfeed_text(page: Page, timeout_ms: int = 45000) -> Tuple[str, str]:
+    """
+    Wait until any likely feed container contains rendered text.
+    Returns:
+        (selector_used, text)
+    """
+    candidate_selectors = [
+        "#mainFeed",
+        "#mainFeed *",
+        "div[id*='Feed']",
+        "div[id*='feed']",
+        ".infinite-container",
+        ".waypoint",
+        "main",
+        "body",
+    ]
 
-    ts_raw = lines[ts_idx]
-    dt = parse_timestamp(ts_raw)
-    if latest_dt is None:
-        age_hours = 0.0
-    else:
-        age_hours = round((latest_dt - dt).total_seconds() / 3600.0, 3)
+    await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    await page.wait_for_timeout(2500)
 
-    return NewsItem(
-        source_order=order_idx,
-        headline=headline,
-        body=body,
-        timestamp_raw=ts_raw,
-        timestamp_iso=dt.isoformat(),
-        age_hours_from_latest=age_hours,
-        tags=sorted(set(tags)),
-        url=url,
+    deadline = max(1, timeout_ms // 1000)
+    best_selector: Optional[str] = None
+    best_text = ""
+
+    for _ in range(deadline):
+        for sel in candidate_selectors:
+            try:
+                loc = page.locator(sel).first
+                count = await loc.count()
+                if count == 0:
+                    continue
+
+                txt = await loc.inner_text(timeout=1000)
+                txt = normalize_text(txt)
+
+                if len(txt) > len(best_text):
+                    best_text = txt
+                    best_selector = sel
+
+                if len(txt) > 300 and TIME_RE.search(txt):
+                    return sel, txt
+            except Exception:
+                pass
+
+        await page.wait_for_timeout(1000)
+
+    raise RuntimeError(
+        f"Timed out waiting for rendered feed text. Best selector={best_selector!r}, best_text_len={len(best_text)}"
     )
 
 
-def extract_candidates(page: Page) -> List[dict]:
-    res = page.evaluate(JS_EXTRACT)
-    if isinstance(res, dict) and res.get("error"):
-        raise RuntimeError(res["error"])
-    return res["items"]
+async def scroll_until_stable(page: Page, root_selector: str = "#mainFeed", max_rounds: int = 40, pause_ms: int = 1200) -> None:
+    previous_len = -1
+    stable_rounds = 0
+
+    for i in range(max_rounds):
+        try:
+            text = normalize_text(await page.locator(root_selector).first.inner_text())
+        except Exception:
+            text = normalize_text(await page.locator("body").inner_text())
+
+        current_len = len(text)
+        log(f"[scroll {i + 1}] {root_selector} text length = {current_len}")
+
+        if current_len == previous_len:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+
+        if stable_rounds >= 3:
+            log("Feed stopped growing; ending early.")
+            break
+
+        previous_len = current_len
+        await page.mouse.wheel(0, 6000)
+        await page.wait_for_timeout(pause_ms)
 
 
-def normalize_items(candidates: List[dict]) -> List[NewsItem]:
-    # First pass to get timestamps.
-    temp = []
-    for i, c in enumerate(candidates):
-        item = candidate_to_item(c, i, None)
-        if item:
-            temp.append(item)
-    if not temp:
-        return []
+async def extract_candidate_blocks(page: Page, root_selector: str = "#mainFeed") -> List[Dict[str, Any]]:
+    js = r"""
+    (rootSelector) => {
+        const roots = [];
+        const preferred = document.querySelector(rootSelector);
+        if (preferred) roots.push(preferred);
 
-    latest_dt = max(datetime.fromisoformat(x.timestamp_iso) for x in temp)
-    items = []
-    seen = set()
-    for i, c in enumerate(candidates):
-        item = candidate_to_item(c, i, latest_dt)
-        if not item:
+        for (const sel of [".infinite-container", ".waypoint", "main", "body"]) {
+            const el = document.querySelector(sel);
+            if (el && !roots.includes(el)) roots.push(el);
+        }
+
+        const badPatterns = [
+            /\bjoin us\b/i,
+            /\bgo real[- ]?time\b/i,
+            /\bdon't like ads\b/i,
+            /\bgo pro\b/i,
+            /\bdiscord\b/i,
+            /\btrack all markets on tradingview\b/i,
+            /\bvoice news\b/i,
+            /\bneed to know market risk\b/i
+        ];
+
+        const timeRe = /\b\d{1,2}:\d{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\b/;
+        const blocks = [];
+        const seen = new Set();
+
+        for (const root of roots) {
+            const nodes = Array.from(root.querySelectorAll("div, li, article, p, span, a"));
+
+            for (const el of nodes) {
+                let txt = (el.innerText || "").trim();
+                if (!txt) continue;
+                if (txt.length < 20) continue;
+                if (!timeRe.test(txt)) continue;
+                if (badPatterns.some(rx => rx.test(txt))) continue;
+
+                txt = txt.replace(/\n{3,}/g, "\n\n");
+
+                if (seen.has(txt)) continue;
+                seen.add(txt);
+
+                blocks.push({
+                    rootTag: root.tagName,
+                    rootId: root.id || "",
+                    rootClass: root.className || "",
+                    tag: el.tagName,
+                    className: el.className || "",
+                    text: txt,
+                    html: el.outerHTML
+                });
+            }
+        }
+
+        return blocks;
+    }
+    """
+    result = await page.evaluate(js, root_selector)
+    return list(result)
+
+
+async def extract_news_items(page: Page, root_selector: str = "#mainFeed") -> List[NewsItem]:
+    raw_blocks = await extract_candidate_blocks(page, root_selector=root_selector)
+    log(f"[info] raw candidate blocks found: {len(raw_blocks)}")
+
+    now = datetime.now()
+    items: List[NewsItem] = []
+
+    for block in raw_blocks:
+        parsed = parse_block_text(block.get("text", ""), now=now)
+        if not parsed:
             continue
-        key = (item.timestamp_raw, item.headline, item.body or "")
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(item)
+        parsed.source_block_tag = block.get("tag")
+        parsed.source_block_class = block.get("className")
+        items.append(parsed)
 
-    items.sort(key=lambda x: x.timestamp_iso, reverse=True)
+    items = dedupe_items(items)
+    items = sort_items_desc(items)
+    log(f"[info] parsed items: {len(items)}")
     return items
 
 
-def reached_target(items: List[NewsItem], hours: float) -> bool:
-    if not items:
-        return False
-    ages = [it.age_hours_from_latest for it in items]
-    return max(ages) >= hours
-
-
-def scroll_until_depth(page: Page, args: argparse.Namespace) -> List[NewsItem]:
-    best_items: List[NewsItem] = []
-    stable_rounds = 0
-
-    for i in range(args.max_scrolls):
-        candidates = extract_candidates(page)
-        items = normalize_items(candidates)
-        if len(items) > len(best_items):
-            best_items = items
-            stable_rounds = 0
-        else:
-            stable_rounds += 1
-
-        if reached_target(best_items, args.hours):
-            print(f"Reached target depth after {i + 1} scrolls with {len(best_items)} items.")
-            break
-
-        page.mouse.wheel(0, 4000)
-        page.wait_for_timeout(int(args.scroll_pause * 1000))
-
-        # Some infinite scroll implementations need explicit bottom jump.
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(int(args.scroll_pause * 1000))
-
-        if stable_rounds >= 12:
-            print("Feed stopped growing; ending early.")
-            break
-
-    return best_items
-
-
-def write_outputs(items: List[NewsItem], out_dir: Path, hours: float) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    json_items = [asdict(x) for x in items]
-    (out_dir / "news.json").write_text(json.dumps(json_items, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    with (out_dir / "news.jsonl").open("w", encoding="utf-8") as f:
-        for row in json_items:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    md_lines = [
-        "# FinancialJuice extracted news",
-        "",
-        f"- extracted_items: {len(items)}",
-        f"- requested_history_hours: {hours}",
-    ]
-    if items:
-        md_lines.extend([
-            f"- newest_item: {items[0].timestamp_iso}",
-            f"- oldest_item: {items[-1].timestamp_iso}",
-            "",
-            "## News items",
-            "",
-        ])
-    for idx, item in enumerate(items, 1):
-        md_lines.append(f"### {idx}. {item.headline}")
-        md_lines.append(f"- timestamp_raw: {item.timestamp_raw}")
-        md_lines.append(f"- timestamp_iso: {item.timestamp_iso}")
-        md_lines.append(f"- age_hours_from_latest: {item.age_hours_from_latest}")
-        md_lines.append(f"- tags: {', '.join(item.tags) if item.tags else '(none)'}")
-        md_lines.append(f"- url: {item.url or '(none)'}")
-        md_lines.append(f"- body: {item.body or '(none)'}")
-        md_lines.append("")
-    (out_dir / "news.md").write_text("\n".join(md_lines), encoding="utf-8")
-
-    summary = {
-        "count": len(items),
-        "requested_history_hours": hours,
-        "newest_item": items[0].timestamp_iso if items else None,
-        "oldest_item": items[-1].timestamp_iso if items else None,
-        "actual_history_hours": max((x.age_hours_from_latest for x in items), default=0),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-
-def main() -> int:
-    args = parse_args()
+async def run_extraction(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
+    debug_dir = out_dir / "debug"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir.mkdir(parents=True, exist_ok=True)
 
-    with sync_playwright() as pw:
-        context = create_context(pw, args)
+    email = os.getenv("FJ_EMAIL", "").strip() or None
+    password = os.getenv("FJ_PASSWORD", "").strip() or None
+
+    async with async_playwright() as pw:
+        context, browser = await create_context(
+            pw,
+            headed=args.headed,
+            user_data_dir=args.user_data_dir,
+        )
         try:
-            page = context.new_page() if hasattr(context, 'new_page') else context.pages[0]
-            maybe_login(page, args)
-            wait_for_feed(page, args.timeout_ms)
-            items = scroll_until_depth(page, args)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            await maybe_login(page, email=email, password=password, manual_login=args.manual_login)
+
+            log(f"[info] current URL: {page.url}")
+            if args.debug:
+                await screenshot_debug(page, debug_dir, "after_login")
+
+            try:
+                root_selector, preview = await wait_for_mainfeed_text(page, timeout_ms=args.wait_ms)
+                log(f"[info] feed selector used: {root_selector}")
+                log("[info] feed text preview:")
+                log(preview[:2000])
+            except (PlaywrightTimeoutError, RuntimeError):
+                await screenshot_debug(page, debug_dir, "mainfeed_timeout")
+                await dump_mainfeed_debug(page, debug_dir)
+                raise RuntimeError(
+                    "Timed out waiting for rendered feed text. "
+                    "Run with --headed --debug and inspect debug_selector_report.txt plus the debug_*.txt files."
+                )
+
+            await scroll_until_stable(
+                page,
+                root_selector=root_selector,
+                max_rounds=args.max_scroll_rounds,
+                pause_ms=args.scroll_pause_ms,
+            )
+
+            if args.debug:
+                await screenshot_debug(page, debug_dir, "after_scroll")
+                await dump_mainfeed_debug(page, debug_dir)
+
+            items = await extract_news_items(page, root_selector=root_selector)
+
             if not items:
-                raise RuntimeError("No news items extracted from #mainFeed. Run with --headed and inspect selectors.")
-            write_outputs(items, out_dir, args.hours)
-            print(json.dumps({
-                "ok": True,
-                "count": len(items),
-                "out_dir": str(out_dir.resolve()),
-                "newest": items[0].timestamp_iso,
-                "oldest": items[-1].timestamp_iso,
-                "history_hours": max(x.age_hours_from_latest for x in items),
-            }, indent=2))
+                raise RuntimeError(
+                    "No news items extracted from rendered feed text. "
+                    "Run with --headed --debug and inspect debug_selector_report.txt plus the debug_*.txt files."
+                )
+
+            filtered = filter_items_by_hours_from_latest(items, hours=args.hours)
+            if not filtered:
+                raise RuntimeError(
+                    f"Extracted {len(items)} items, but none remained after filtering to {args.hours} hours."
+                )
+
+            write_outputs(filtered, out_dir=out_dir, hours=args.hours)
+
+            log("")
+            log("[done] extraction complete")
+            log(f"[done] total parsed items: {len(items)}")
+            log(f"[done] items in {args.hours}h window: {len(filtered)}")
             return 0
+
         finally:
-            context.close()
+            await context.close()
+            if browser is not None:
+                await browser.close()
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Extract FinancialJuice news feed data into AI-ready structured files."
+    )
+    parser.add_argument("--hours", type=int, default=24, help="Hours back from the latest extracted item.")
+    parser.add_argument("--out-dir", default="out", help="Output directory.")
+    parser.add_argument("--headed", action="store_true", help="Run with visible browser.")
+    parser.add_argument("--manual-login", action="store_true", help="Pause for manual login in browser.")
+    parser.add_argument(
+        "--user-data-dir",
+        default=None,
+        help="Persistent browser profile directory. Useful for reusing an authenticated session.",
+    )
+    parser.add_argument("--wait-ms", type=int, default=45000, help="Timeout waiting for rendered feed text.")
+    parser.add_argument("--max-scroll-rounds", type=int, default=40, help="Maximum scroll rounds.")
+    parser.add_argument("--scroll-pause-ms", type=int, default=1200, help="Pause between scrolls.")
+    parser.add_argument("--debug", action="store_true", help="Write screenshots and feed dumps for debugging.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    try:
+        return asyncio.run(run_extraction(args))
+    except KeyboardInterrupt:
+        log("\n[abort] interrupted by user")
+        return 130
+    except Exception as exc:
+        log(f"[error] {exc}")
+        return 1
 
 
 if __name__ == "__main__":
