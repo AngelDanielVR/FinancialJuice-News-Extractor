@@ -1,31 +1,15 @@
 """
 financialjuice_extractor.py
 
-Robust FinancialJuice feed extractor using Playwright.
+Extractor robusto de FinancialJuice usando Playwright.
 
-Key design choices:
-- Uses a real browser session (Playwright) because the feed is rendered dynamically.
-- Supports login via environment variables, manual login, or a persistent browser profile.
-- Waits for any likely feed container to contain rendered text, not just #mainFeed.
-- Scrolls until feed growth stabilizes.
-- Extracts candidate blocks using timestamp-based heuristics instead of brittle CSS classes.
-- Filters to at least N hours from the latest extracted item.
-- Exports JSONL / JSON / Markdown / summary.
-
-Typical usage:
-    pip install playwright python-dateutil
-    playwright install chromium
-
-    export FJ_EMAIL="your_email"
-    export FJ_PASSWORD="your_password"
-
-    python financialjuice_extractor.py --hours 24 --out-dir out
-
-Manual login mode:
-    python financialjuice_extractor.py --manual-login --headed --hours 24 --out-dir out
-
-Persistent browser profile:
-    python financialjuice_extractor.py --headed --user-data-dir ./user_data --hours 24 --out-dir out
+Características principales:
+- Soporta login manual, credenciales directas o perfil persistente del navegador.
+- Espera a que el feed renderice texto real y no depende de un selector único.
+- Hace scroll hasta que el feed deja de crecer.
+- Extrae bloques candidatos mediante heurísticas basadas en timestamp.
+- Exporta resultados estructurados en JSONL / JSON / Markdown.
+- Incluye una API reutilizable para que main.py pueda lanzar la extracción de forma programada.
 """
 
 from __future__ import annotations
@@ -33,10 +17,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import re
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,6 +78,50 @@ class NewsItem:
     age_from_latest_minutes: Optional[int] = None
 
 
+@dataclass
+class ExtractionResult:
+    run_label: str
+    out_dir: str
+    jsonl_path: str
+    json_path: str
+    markdown_path: str
+    summary_path: str
+    exported_items: int
+    latest_timestamp_iso: Optional[str]
+    earliest_timestamp_iso: Optional[str]
+    items: List[Dict[str, Any]]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_label": self.run_label,
+            "out_dir": self.out_dir,
+            "jsonl_path": self.jsonl_path,
+            "json_path": self.json_path,
+            "markdown_path": self.markdown_path,
+            "summary_path": self.summary_path,
+            "exported_items": self.exported_items,
+            "latest_timestamp_iso": self.latest_timestamp_iso,
+            "earliest_timestamp_iso": self.earliest_timestamp_iso,
+            "items": self.items,
+        }
+
+
+@dataclass
+class ExtractorConfig:
+    repository_dir: str | Path
+    hours: int = 6
+    headed: bool = False
+    manual_login: bool = False
+    user_data_dir: Optional[str] = None
+    wait_ms: int = 45000
+    max_scroll_rounds: int = 40
+    scroll_pause_ms: int = 1200
+    debug: bool = False
+    email: Optional[str] = None
+    password: Optional[str] = None
+    run_label: Optional[str] = None
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -114,10 +141,6 @@ def text_looks_like_noise(text: str) -> bool:
 
 
 def parse_timestamp_text(ts_text: str, now: Optional[datetime] = None) -> Optional[datetime]:
-    """
-    Parse timestamps like: '17:51 Apr 18'
-    Infer year by choosing the closest plausible year to 'now'.
-    """
     now = now or datetime.now()
     m = TIME_RE.search(ts_text)
     if not m:
@@ -306,7 +329,7 @@ def build_markdown(items: List[NewsItem], hours: int) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def write_outputs(items: List[NewsItem], out_dir: Path, hours: int) -> None:
+def write_outputs(items: List[NewsItem], out_dir: Path, hours: int) -> Dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     jsonl_path = out_dir / "news.jsonl"
@@ -331,7 +354,7 @@ def write_outputs(items: List[NewsItem], out_dir: Path, hours: int) -> None:
         "window_hours": hours,
         "latest_timestamp_iso": latest_iso,
         "earliest_timestamp_iso": earliest_iso,
-        "generated_at_iso": datetime.utcnow().isoformat() + "Z",
+        "generated_at_iso": datetime.now(timezone.utc).isoformat(),
         "files": {
             "jsonl": str(jsonl_path),
             "json": str(json_path),
@@ -344,6 +367,13 @@ def write_outputs(items: List[NewsItem], out_dir: Path, hours: int) -> None:
     log(f"[ok] wrote {json_path}")
     log(f"[ok] wrote {md_path}")
     log(f"[ok] wrote {summary_path}")
+
+    return {
+        "jsonl": jsonl_path,
+        "json": json_path,
+        "markdown": md_path,
+        "summary": summary_path,
+    }
 
 
 async def screenshot_debug(page: Page, out_dir: Path, name: str) -> None:
@@ -374,15 +404,7 @@ def selector_to_filename_part(selector: str) -> str:
 async def dump_mainfeed_debug(page: Page, out_dir: Path) -> None:
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        selectors = [
-            "#mainFeed",
-            ".infinite-container",
-            ".waypoint",
-            "main",
-            "body",
-        ]
-
+        selectors = ["#mainFeed", ".infinite-container", ".waypoint", "main", "body"]
         debug_report = []
 
         for sel in selectors:
@@ -398,30 +420,21 @@ async def dump_mainfeed_debug(page: Page, out_dir: Path) -> None:
 
                 txt = normalize_text(txt)
                 base = selector_to_filename_part(sel)
-
                 (out_dir / f"debug_{base}.txt").write_text(txt, encoding="utf-8")
                 (out_dir / f"debug_{base}.html").write_text(html, encoding="utf-8")
-
                 debug_report.append(
-                    f"=== SELECTOR: {sel} ===\n"
-                    f"text_len={len(txt)}\n"
-                    f"preview:\n{txt[:2000]}\n\n"
+                    f"=== SELECTOR: {sel} ===\ntext_len={len(txt)}\npreview:\n{txt[:2000]}\n\n"
                 )
             except Exception as exc:
                 debug_report.append(f"=== SELECTOR: {sel} ===\nERROR: {exc}\n\n")
 
         (out_dir / "debug_selector_report.txt").write_text("".join(debug_report), encoding="utf-8")
         log(f"[debug] wrote {out_dir / 'debug_selector_report.txt'}")
-
     except Exception as exc:
         log(f"[debug] feed dump failed: {exc}")
 
 
-async def create_context(
-    pw,
-    headed: bool,
-    user_data_dir: Optional[str],
-) -> Tuple[BrowserContext, Optional[Any]]:
+async def create_context(pw, headed: bool, user_data_dir: Optional[str]) -> Tuple[BrowserContext, Optional[Any]]:
     if user_data_dir:
         context = await pw.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
@@ -475,16 +488,11 @@ async def maybe_login(page: Page, email: Optional[str], password: Optional[str],
         pass
 
     if not email or not password:
-        log("[warn] FJ_EMAIL / FJ_PASSWORD not provided. Proceeding without scripted login.")
+        log("[warn] No FinancialJuice credentials provided. Proceeding without scripted login.")
         return
 
     tried_modal = False
-    candidate_buttons = [
-        "text=Login",
-        "text=Sign In",
-        "#liSignIn",
-        "a[href*='login']",
-    ]
+    candidate_buttons = ["text=Login", "text=Sign In", "#liSignIn", "a[href*='login']"]
     for sel in candidate_buttons:
         try:
             loc = page.locator(sel).first
@@ -505,14 +513,8 @@ async def maybe_login(page: Page, email: Optional[str], password: Optional[str],
         except Exception:
             pass
 
-    email_selectors = [
-        "#ctl00_SignInSignUp_loginForm1_inputEmail",
-        "input[type='email']",
-    ]
-    pass_selectors = [
-        "#ctl00_SignInSignUp_loginForm1_inputPassword",
-        "input[type='password']",
-    ]
+    email_selectors = ["#ctl00_SignInSignUp_loginForm1_inputEmail", "input[type='email']"]
+    pass_selectors = ["#ctl00_SignInSignUp_loginForm1_inputPassword", "input[type='password']"]
     submit_selectors = [
         "#ctl00_SignInSignUp_loginForm1_btnLogin",
         "input[type='submit'][value='Login']",
@@ -572,11 +574,6 @@ async def maybe_login(page: Page, email: Optional[str], password: Optional[str],
 
 
 async def wait_for_mainfeed_text(page: Page, timeout_ms: int = 45000) -> Tuple[str, str]:
-    """
-    Wait until any likely feed container contains rendered text.
-    Returns:
-        (selector_used, text)
-    """
     candidate_selectors = [
         "#mainFeed",
         "#mainFeed *",
@@ -678,19 +675,15 @@ async def extract_candidate_blocks(page: Page, root_selector: str = "#mainFeed")
 
         for (const root of roots) {
             const nodes = Array.from(root.querySelectorAll("div, li, article, p, span, a"));
-
             for (const el of nodes) {
                 let txt = (el.innerText || "").trim();
                 if (!txt) continue;
                 if (txt.length < 20) continue;
                 if (!timeRe.test(txt)) continue;
                 if (badPatterns.some(rx => rx.test(txt))) continue;
-
                 txt = txt.replace(/\n{3,}/g, "\n\n");
-
                 if (seen.has(txt)) continue;
                 seen.add(txt);
-
                 blocks.push({
                     rootTag: root.tagName,
                     rootId: root.id || "",
@@ -731,14 +724,17 @@ async def extract_news_items(page: Page, root_selector: str = "#mainFeed") -> Li
     return items
 
 
-async def run_extraction(args: argparse.Namespace) -> int:
+async def run_extraction(
+    args: argparse.Namespace,
+    email: Optional[str] = None,
+    password: Optional[str] = None,
+    run_label: Optional[str] = None,
+) -> ExtractionResult:
     out_dir = Path(args.out_dir)
     debug_dir = out_dir / "debug"
     out_dir.mkdir(parents=True, exist_ok=True)
     debug_dir.mkdir(parents=True, exist_ok=True)
-
-    email = os.getenv("FJ_EMAIL", "").strip() or None
-    password = os.getenv("FJ_PASSWORD", "").strip() or None
+    run_label = run_label or out_dir.name
 
     async with async_playwright() as pw:
         context, browser = await create_context(
@@ -793,18 +789,90 @@ async def run_extraction(args: argparse.Namespace) -> int:
                     f"Extracted {len(items)} items, but none remained after filtering to {args.hours} hours."
                 )
 
-            write_outputs(filtered, out_dir=out_dir, hours=args.hours)
+            artifacts = write_outputs(filtered, out_dir=out_dir, hours=args.hours)
 
             log("")
             log("[done] extraction complete")
             log(f"[done] total parsed items: {len(items)}")
             log(f"[done] items in {args.hours}h window: {len(filtered)}")
-            return 0
+
+            latest_iso = filtered[0].timestamp_iso if filtered else None
+            earliest_iso = filtered[-1].timestamp_iso if filtered else None
+
+            return ExtractionResult(
+                run_label=run_label,
+                out_dir=str(out_dir),
+                jsonl_path=str(artifacts["jsonl"]),
+                json_path=str(artifacts["json"]),
+                markdown_path=str(artifacts["markdown"]),
+                summary_path=str(artifacts["summary"]),
+                exported_items=len(filtered),
+                latest_timestamp_iso=latest_iso,
+                earliest_timestamp_iso=earliest_iso,
+                items=[asdict(item) for item in filtered],
+            )
 
         finally:
             await context.close()
             if browser is not None:
                 await browser.close()
+
+
+def load_jsonl_items(jsonl_path: str | Path) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    path = Path(jsonl_path)
+    if not path.exists():
+        return items
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            items.append(json.loads(line))
+    return items
+
+
+def build_runtime_args(out_dir: str | Path, hours: int, headed: bool, manual_login: bool, user_data_dir: Optional[str], wait_ms: int, max_scroll_rounds: int, scroll_pause_ms: int, debug: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        hours=hours,
+        out_dir=str(out_dir),
+        headed=headed,
+        manual_login=manual_login,
+        user_data_dir=user_data_dir,
+        wait_ms=wait_ms,
+        max_scroll_rounds=max_scroll_rounds,
+        scroll_pause_ms=scroll_pause_ms,
+        debug=debug,
+    )
+
+
+def extract_to_repository(config: ExtractorConfig) -> ExtractionResult:
+    repository_dir = Path(config.repository_dir)
+    run_label = config.run_label or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = repository_dir / "financialjuice" / run_label
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    args = build_runtime_args(
+        out_dir=out_dir,
+        hours=config.hours,
+        headed=config.headed,
+        manual_login=config.manual_login,
+        user_data_dir=config.user_data_dir,
+        wait_ms=config.wait_ms,
+        max_scroll_rounds=config.max_scroll_rounds,
+        scroll_pause_ms=config.scroll_pause_ms,
+        debug=config.debug,
+    )
+
+    return asyncio.run(
+        run_extraction(
+            args,
+            email=config.email,
+            password=config.password,
+            run_label=run_label,
+        )
+    )
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -820,6 +888,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Persistent browser profile directory. Useful for reusing an authenticated session.",
     )
+    parser.add_argument("--email", default=None, help="FinancialJuice email (optional).")
+    parser.add_argument("--password", default=None, help="FinancialJuice password (optional).")
     parser.add_argument("--wait-ms", type=int, default=45000, help="Timeout waiting for rendered feed text.")
     parser.add_argument("--max-scroll-rounds", type=int, default=40, help="Maximum scroll rounds.")
     parser.add_argument("--scroll-pause-ms", type=int, default=1200, help="Pause between scrolls.")
@@ -827,10 +897,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def cli_main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        return asyncio.run(run_extraction(args))
+        result = asyncio.run(
+            run_extraction(
+                args,
+                email=args.email,
+                password=args.password,
+            )
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
     except KeyboardInterrupt:
         log("\n[abort] interrupted by user")
         return 130
@@ -840,4 +918,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())
