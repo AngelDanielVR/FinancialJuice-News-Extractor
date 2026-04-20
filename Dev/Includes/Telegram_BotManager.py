@@ -65,8 +65,29 @@ def sanitize_hashtag(tag: str) -> str:
     return cleaned[:30]
 
 
+def safe_int(value: Any, default: int = 0, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    if minimum is not None:
+        number = max(minimum, number)
+    if maximum is not None:
+        number = min(maximum, number)
+    return number
+
+
+def join_model_names(value: Any, max_chars: int = 180) -> str:
+    if isinstance(value, list):
+        parts = [str(x).strip() for x in value if str(x).strip()]
+        text = ", ".join(parts)
+    else:
+        text = str(value or "").strip()
+    return truncate_text(text, max_chars)
+
+
 def build_news_card(item: Dict[str, Any]) -> str:
-    importance = max(1, min(5, int(item.get("importance_level", 3) or 3)))
+    importance = safe_int(item.get("importance_level", 3), default=3, minimum=1, maximum=5)
     headline = html_escape(item.get("translated_headline", "SIN TITULAR"), 180)
     summary = html_escape(item.get("summary_es", "Sin resumen disponible."), 650)
     timestamp = html_escape(item.get("timestamp_text", ""), 40)
@@ -88,15 +109,17 @@ def build_news_card(item: Dict[str, Any]) -> str:
     ]
     if tag_line:
         parts.append(f"🏷 <code>{html_escape(tag_line, 220)}</code>")
-    parts.append(f"🕒 <code>{timestamp}</code>")
+    if timestamp:
+        parts.append(f"🕒 <code>{timestamp}</code>")
     parts.append(f"📊 <b>Sesgo:</b> {direction_emoji(market_bias)} <b>{html_escape(market_bias, 12)}</b>")
     parts.append(f"💬 <i>{impact_reason}</i>")
     return "\n".join(parts)
 
 
 def build_index_lines(label: str, payload: Dict[str, Any]) -> str:
+    payload = payload or {}
     direction = str(payload.get("direction", "NEUTRAL") or "NEUTRAL").upper()
-    confidence = int(payload.get("confidence", 50) or 50)
+    confidence = safe_int(payload.get("confidence", 50), default=50, minimum=0, maximum=100)
     reason = html_escape(payload.get("reason", "Sin comentario disponible."), 260)
     emoji = direction_emoji(direction)
     return (
@@ -105,19 +128,32 @@ def build_index_lines(label: str, payload: Dict[str, Any]) -> str:
     )
 
 
+def build_market_overview_section(processed_batch: Dict[str, Any]) -> str:
+    market_overview = html_escape(
+        processed_batch.get("market_overview", "Sin resumen agregado disponible."),
+        1400,
+    )
+    return "\n".join(
+        [
+            "🌍 <b>VISIÓN GENERAL DEL MERCADO</b>",
+            market_overview,
+        ]
+    )
+
+
 def build_market_impact_section(processed_batch: Dict[str, Any]) -> str:
-    impact = processed_batch.get("global_market_impact", {})
+    impact = processed_batch.get("global_market_impact", {}) or {}
     lines = ["📈 <b>IMPACTO AGREGADO DE MERCADO</b>"]
     lines.append("")
     lines.append(build_index_lines("IBEX35", impact.get("ibex35", {})))
     lines.append("")
     lines.append(build_index_lines("EUROSTOXX50", impact.get("eurostoxx50", {})))
     lines.append("")
-    lines.append(build_index_lines("S&P500", impact.get("sp500", {})))
+    lines.append(build_index_lines("S&amp;P500", impact.get("sp500", {})))
     lines.append("")
     lines.append(build_index_lines("NIKKEI225", impact.get("nikkei225", {})))
 
-    assets = impact.get("impacted_assets", [])
+    assets = impact.get("impacted_assets", []) or []
     if assets:
         lines.append("")
         lines.append("🎯 <b>ACTIVOS DESTACADOS</b>")
@@ -133,20 +169,34 @@ def build_market_impact_section(processed_batch: Dict[str, Any]) -> str:
                 f"  {reason}"
             )
 
-    lines.append("")
-    lines.append("🧭 <b>COMENTARIO FINAL</b>")
-    lines.append(html_escape(impact.get("final_commentary", "Sin comentario final disponible."), 1500))
     return "\n".join(lines)
 
 
+def build_final_commentary_section(processed_batch: Dict[str, Any]) -> str:
+    impact = processed_batch.get("global_market_impact", {}) or {}
+    final_commentary = html_escape(
+        impact.get("final_commentary", "Sin comentario final disponible."),
+        1800,
+    )
+    return "\n".join(
+        [
+            "🧭 <b>COMENTARIO FINAL</b>",
+            final_commentary,
+        ]
+    )
+
+
 def build_header_section(processed_batch: Dict[str, Any], run_label: Optional[str] = None) -> str:
-    meta = processed_batch.get("meta", {})
+    meta = processed_batch.get("meta", {}) or {}
     batch_title = html_escape(processed_batch.get("batch_title", "Resumen de noticias"), 120)
-    market_overview = html_escape(processed_batch.get("market_overview", "Sin resumen agregado disponible."), 900)
-    batch_size = len(processed_batch.get("items", []))
+    batch_size = len(processed_batch.get("items", []) or [])
     generated_at = html_escape(meta.get("generated_at_iso", ""), 40)
-    batch_model = html_escape(meta.get("batch_structuring_model", ""), 60)
-    commentary_model = html_escape(meta.get("market_commentary_model", ""), 60)
+
+    batch_models = join_model_names(
+        meta.get("batch_structuring_models") or meta.get("batch_structuring_model") or "",
+        max_chars=180,
+    )
+    commentary_model = join_model_names(meta.get("market_commentary_model") or "", max_chars=80)
 
     parts = [
         f"📰 <b>{batch_title}</b>",
@@ -156,20 +206,38 @@ def build_header_section(processed_batch: Dict[str, Any], run_label: Optional[st
         parts.append(f"<b>Lote:</b> <code>{html_escape(run_label, 50)}</code>")
     if generated_at:
         parts.append(f"<b>Generado:</b> <code>{generated_at}</code>")
-    if batch_model and commentary_model and batch_model != commentary_model:
-        parts.append(f"<b>Modelos:</b> <code>{batch_model}</code> + <code>{commentary_model}</code>")
-    elif batch_model:
-        parts.append(f"<b>Modelo:</b> <code>{batch_model}</code>")
-    parts.append("")
-    parts.append(market_overview)
+
+    if batch_models and commentary_model:
+        if batch_models == commentary_model:
+            parts.append(f"<b>Modelo:</b> <code>{html_escape(batch_models, 180)}</code>")
+        else:
+            parts.append(
+                f"<b>Modelos:</b> <code>{html_escape(batch_models, 180)}</code> + "
+                f"<code>{html_escape(commentary_model, 80)}</code>"
+            )
+    elif batch_models:
+        parts.append(f"<b>Modelo:</b> <code>{html_escape(batch_models, 180)}</code>")
+    elif commentary_model:
+        parts.append(f"<b>Modelo comentario:</b> <code>{html_escape(commentary_model, 80)}</code>")
+
     return "\n".join(parts)
 
 
 def build_telegram_sections(processed_batch: Dict[str, Any], run_label: Optional[str] = None) -> List[str]:
     sections: List[str] = [build_header_section(processed_batch, run_label=run_label)]
-    for item in processed_batch.get("items", []):
-        sections.append(build_news_card(item))
+
+    # Recupera explícitamente el overview, que ahora viene fuera del header lógico del lote.
+    sections.append(build_market_overview_section(processed_batch))
+
+    items = processed_batch.get("items", []) or []
+    if items:
+        sections.append("🗞 <b>NOTICIAS DESTACADAS</b>")
+        for item in items:
+            sections.append(build_news_card(item))
+
+    # Recupera explícitamente impacto agregado y comentario final.
     sections.append(build_market_impact_section(processed_batch))
+    sections.append(build_final_commentary_section(processed_batch))
     return sections
 
 
@@ -206,6 +274,8 @@ def pack_sections_into_messages(sections: Sequence[str], max_length: int = SAFE_
     current = ""
 
     for section in sections:
+        if not section or not str(section).strip():
+            continue
         for piece in _force_split_section(section, max_length=max_length):
             candidate = piece if not current else f"{current}\n\n{piece}"
             if len(candidate) <= max_length:

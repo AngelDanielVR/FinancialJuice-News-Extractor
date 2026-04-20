@@ -4,7 +4,7 @@ news_ai_proccesing.py
 Procesado por IA en lote para noticias nuevas de FinancialJuice.
 
 Objetivos:
-- Hacer una sola llamada por lote para estructurar noticias nuevas.
+- Procesar noticias nuevas por lotes (chunking) para evitar respuestas JSON demasiado grandes.
 - Permitir una segunda llamada opcional para el comentario agregado de mercado,
   pudiendo usar un modelo distinto.
 - Repartir carga entre varios modelos Gemini y aplicar fallback si alguno falla.
@@ -30,6 +30,10 @@ from google.genai import errors
 
 MAX_INPUT_BODY_CHARS = 700
 DEFAULT_MAX_STORED_IDS = 10000
+DEFAULT_STRUCTURING_CHUNK_SIZE = 20
+DEFAULT_MAX_NEWS_PER_CYCLE = 60
+DEFAULT_MAX_JSON_REPAIR_ATTEMPTS = 1
+
 _DIRECTION_VALUES = {"ALCISTA", "BAJISTA", "NEUTRAL", "MIXTO"}
 _ASSET_TYPE_VALUES = {"INDEX", "STOCK", "ETF", "FOREX", "BOND", "COMMODITY", "CRYPTO", "UNKNOWN"}
 
@@ -44,6 +48,9 @@ class AIProcessingConfig:
     models: Optional[Dict[str, Dict[str, Any]]] = None
     routes: Optional[Dict[str, Dict[str, Any]]] = None
     usage_state_path: Optional[str] = None
+    structuring_chunk_size: int = DEFAULT_STRUCTURING_CHUNK_SIZE
+    max_news_per_cycle: int = DEFAULT_MAX_NEWS_PER_CYCLE
+    max_json_repair_attempts: int = DEFAULT_MAX_JSON_REPAIR_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +92,13 @@ def attach_news_ids(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         cloned["news_id"] = cloned.get("news_id") or build_news_id(cloned)
         enriched.append(cloned)
     return enriched
+
+
+def chunk_sequence(items: Sequence[Dict[str, Any]], chunk_size: int) -> List[List[Dict[str, Any]]]:
+    if chunk_size <= 0:
+        chunk_size = DEFAULT_STRUCTURING_CHUNK_SIZE
+    sequence = list(items)
+    return [sequence[i:i + chunk_size] for i in range(0, len(sequence), chunk_size)]
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +146,11 @@ def filter_unprocessed_news(items: Sequence[Dict[str, Any]], state: Dict[str, An
     return new_items
 
 
-def mark_news_as_processed(state: Dict[str, Any], items: Sequence[Dict[str, Any]], max_stored_ids: int = DEFAULT_MAX_STORED_IDS) -> Dict[str, Any]:
+def mark_news_as_processed(
+    state: Dict[str, Any],
+    items: Sequence[Dict[str, Any]],
+    max_stored_ids: int = DEFAULT_MAX_STORED_IDS,
+) -> Dict[str, Any]:
     processed_ids = list(state.get("processed_ids", []))
     known = set(processed_ids)
 
@@ -297,12 +315,24 @@ def normalize_processing_config(config: AIProcessingConfig) -> Dict[str, Any]:
                 "temperature": config.temperature,
                 "max_output_tokens": min(config.max_output_tokens, 4096),
             },
+            "json_repair": {
+                "models": [config.model],
+                "temperature": 0.0,
+                "max_output_tokens": min(config.max_output_tokens, 4096),
+            },
         }
 
     for route_name, route in routes.items():
+        if route_name == "market_commentary":
+            default_tokens = min(config.max_output_tokens, 4096)
+        elif route_name == "json_repair":
+            default_tokens = min(config.max_output_tokens, 4096)
+        else:
+            default_tokens = config.max_output_tokens
+
         route.setdefault("models", list(models.keys()))
-        route.setdefault("temperature", config.temperature)
-        route.setdefault("max_output_tokens", config.max_output_tokens)
+        route.setdefault("temperature", config.temperature if route_name != "json_repair" else 0.0)
+        route.setdefault("max_output_tokens", default_tokens)
         routes[route_name] = route
 
     return {
@@ -310,6 +340,9 @@ def normalize_processing_config(config: AIProcessingConfig) -> Dict[str, Any]:
         "routes": routes,
         "separate_market_commentary": bool(config.separate_market_commentary),
         "usage_state_path": config.usage_state_path,
+        "structuring_chunk_size": max(1, int(config.structuring_chunk_size or DEFAULT_STRUCTURING_CHUNK_SIZE)),
+        "max_news_per_cycle": max(1, int(config.max_news_per_cycle or DEFAULT_MAX_NEWS_PER_CYCLE)),
+        "max_json_repair_attempts": max(0, int(config.max_json_repair_attempts or 0)),
     }
 
 
@@ -495,22 +528,90 @@ def build_market_commentary_schema() -> Dict[str, Any]:
     }
 
 
+def build_json_repair_prompt(raw_text: str, schema: Dict[str, Any], route_name: str) -> str:
+    schema_payload = json.dumps(schema, ensure_ascii=False, indent=2)
+    return f"""
+Corrige la siguiente salida para que sea JSON válido y estrictamente compatible con el esquema indicado.
+Devuelve solo JSON válido. No escribas texto adicional.
+
+Ruta: {route_name}
+
+Esquema:
+{schema_payload}
+
+Salida defectuosa:
+{raw_text}
+""".strip()
+
+
 # ---------------------------------------------------------------------------
 # Parseo y normalizacion
 # ---------------------------------------------------------------------------
 
-def extract_first_json_block(text: str) -> str:
+def strip_code_fences(text: str) -> str:
     text = (text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
+
+
+def extract_first_balanced_json_block(text: str) -> str:
+    text = strip_code_fences(text)
     if not text:
         raise ValueError("The AI response is empty.")
 
-    if text.startswith("{") and text.endswith("}"):
-        return text
+    start_positions = [idx for idx, ch in enumerate(text) if ch in "{["]
+    for start in start_positions:
+        opening = text[start]
+        closing = "}" if opening == "{" else "]"
+        depth = 0
+        in_string = False
+        escape = False
 
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        raise ValueError("Could not locate a JSON object in the AI response.")
-    return match.group(0)
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == opening:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
+                if depth == 0:
+                    return text[start:idx + 1]
+
+    raise ValueError("Could not locate a balanced JSON block in the AI response.")
+
+
+def parse_json_lenient(text: str) -> Dict[str, Any]:
+    cleaned = strip_code_fences(text)
+    if not cleaned:
+        raise ValueError("The AI response is empty.")
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError("JSON root is not an object.")
+    except Exception:
+        pass
+
+    candidate = extract_first_balanced_json_block(cleaned)
+    parsed = json.loads(candidate)
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON root is not an object.")
+    return parsed
 
 
 def clamp_importance(value: Any) -> int:
@@ -555,6 +656,16 @@ def fallback_item_from_source(item: Dict[str, Any]) -> Dict[str, Any]:
         "impact_reason": "La IA no devolvió un análisis válido para esta noticia y se dejó en estado neutral por seguridad.",
         "tags": list(item.get("tags", [])),
         "timestamp_text": str(item.get("timestamp_text", "") or ""),
+    }
+
+
+def build_local_structuring_fallback(news_items: Sequence[Dict[str, Any]], batch_title: Optional[str] = None) -> Dict[str, Any]:
+    source_items = attach_news_ids(news_items)
+    return {
+        "batch_title": truncate_text(batch_title or "Resumen local de noticias de mercado", 120),
+        "items": [fallback_item_from_source(item) for item in source_items],
+        "source_news": source_items,
+        "generated_locally": True,
     }
 
 
@@ -604,7 +715,10 @@ def normalize_structuring_output(raw_output: Dict[str, Any], source_news_items: 
                 continue
             normalized_items_map[source_id] = {
                 "source_id": source_id,
-                "translated_headline": truncate_text(str(item.get("translated_headline", "") or "").strip() or source_map[source_id].get("headline", "").upper(), 180),
+                "translated_headline": truncate_text(
+                    str(item.get("translated_headline", "") or "").strip() or source_map[source_id].get("headline", "").upper(),
+                    180,
+                ),
                 "summary_es": truncate_text(str(item.get("summary_es", "") or "").strip() or "Sin resumen disponible.", 500),
                 "importance_level": clamp_importance(item.get("importance_level")),
                 "market_bias": normalize_direction(item.get("market_bias")),
@@ -647,14 +761,14 @@ def normalize_market_commentary_output(raw_output: Dict[str, Any]) -> Dict[str, 
 # Llamadas a modelos y fallback por rutas
 # ---------------------------------------------------------------------------
 
-def _call_single_model(
+def _call_single_model_raw(
     model_name: str,
     api_key: str,
     prompt: str,
     schema: Dict[str, Any],
     temperature: float,
     max_output_tokens: int,
-) -> Dict[str, Any]:
+) -> str:
     with genai.Client(api_key=api_key) as client:
         response = client.models.generate_content(
             model=model_name,
@@ -668,13 +782,31 @@ def _call_single_model(
         )
 
     response_text = getattr(response, "text", None)
-    if not response_text:
-        parsed = getattr(response, "parsed", None)
-        if parsed is None:
-            raise RuntimeError("Gemini returned an empty response.")
-        response_text = json.dumps(parsed, ensure_ascii=False)
+    if response_text:
+        return response_text
 
-    return json.loads(extract_first_json_block(response_text))
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        return json.dumps(parsed, ensure_ascii=False)
+
+    raise RuntimeError("Gemini returned an empty response.")
+
+
+def _repair_json_with_model(
+    broken_text: str,
+    schema: Dict[str, Any],
+    route_name: str,
+    routing_config: Dict[str, Any],
+) -> Tuple[Dict[str, Any], str]:
+    repair_prompt = build_json_repair_prompt(broken_text, schema, route_name)
+    repair_raw, repair_model, _ = generate_json_with_routing(
+        prompt=repair_prompt,
+        schema=schema,
+        route_name="json_repair",
+        routing_config=routing_config,
+        allow_repair=False,
+    )
+    return repair_raw, repair_model
 
 
 def generate_json_with_routing(
@@ -682,6 +814,7 @@ def generate_json_with_routing(
     schema: Dict[str, Any],
     route_name: str,
     routing_config: Dict[str, Any],
+    allow_repair: bool = True,
 ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
     models = routing_config["models"]
     routes = routing_config["routes"]
@@ -692,6 +825,7 @@ def generate_json_with_routing(
     usage_state_path = routing_config.get("usage_state_path")
     usage_state = load_model_usage_state(usage_state_path)
     attempts: List[Dict[str, Any]] = []
+    max_repair_attempts = int(routing_config.get("max_json_repair_attempts", 0))
 
     for model_name in route.get("models", []):
         model_spec = models.get(model_name)
@@ -713,7 +847,7 @@ def generate_json_with_routing(
         max_output_tokens = int(route.get("max_output_tokens", model_spec.get("max_output_tokens", 8192)))
 
         try:
-            raw_output = _call_single_model(
+            raw_text = _call_single_model_raw(
                 model_name=model_name,
                 api_key=api_key,
                 prompt=prompt,
@@ -721,8 +855,48 @@ def generate_json_with_routing(
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
             )
-            attempts.append({"model_name": model_name, "route_name": route_name, "error": None})
-            return raw_output, model_name, attempts
+
+            try:
+                raw_output = parse_json_lenient(raw_text)
+                attempts.append({"model_name": model_name, "route_name": route_name, "error": None})
+                return raw_output, model_name, attempts
+            except Exception as parse_exc:
+                if allow_repair and max_repair_attempts > 0 and "json_repair" in routes:
+                    repaired = False
+                    repair_errors: List[str] = []
+                    for _ in range(max_repair_attempts):
+                        try:
+                            repaired_output, repair_model = _repair_json_with_model(
+                                broken_text=raw_text,
+                                schema=schema,
+                                route_name=route_name,
+                                routing_config=routing_config,
+                            )
+                            attempts.append(
+                                {
+                                    "model_name": model_name,
+                                    "route_name": route_name,
+                                    "error": None,
+                                    "repaired_by": repair_model,
+                                }
+                            )
+                            return repaired_output, model_name, attempts
+                        except Exception as repair_exc:
+                            repair_errors.append(str(repair_exc))
+                    attempts.append(
+                        {
+                            "model_name": model_name,
+                            "route_name": route_name,
+                            "error": f"{parse_exc} | repair failed: {' | '.join(repair_errors)}",
+                        }
+                    )
+                    repaired = True
+                    if repaired:
+                        continue
+
+                attempts.append({"model_name": model_name, "route_name": route_name, "error": str(parse_exc)})
+                continue
+
         except errors.APIError as exc:
             code = getattr(exc, "code", "unknown")
             message = getattr(exc, "message", str(exc))
@@ -802,21 +976,96 @@ def build_local_commentary_fallback(structured_batch: Dict[str, Any]) -> Dict[st
 # Orquestacion principal
 # ---------------------------------------------------------------------------
 
+def _aggregate_structured_batches(structured_batches: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    all_items: List[Dict[str, Any]] = []
+    all_source_news: List[Dict[str, Any]] = []
+    batch_titles: List[str] = []
+
+    for batch in structured_batches:
+        title = str(batch.get("batch_title", "") or "").strip()
+        if title:
+            batch_titles.append(title)
+        all_items.extend(batch.get("items", []))
+        all_source_news.extend(batch.get("source_news", []))
+
+    batch_title = "Resumen de noticias de mercado"
+    if batch_titles:
+        batch_title = truncate_text(batch_titles[0], 120)
+
+    return {
+        "batch_title": batch_title,
+        "items": all_items,
+        "source_news": all_source_news,
+    }
+
+
 def process_news_batch(news_items: Sequence[Dict[str, Any]], config: AIProcessingConfig) -> Dict[str, Any]:
     if not news_items:
         raise ValueError("No news items were supplied for AI processing.")
 
     routing_config = normalize_processing_config(config)
 
-    structuring_prompt = build_structuring_prompt(news_items)
+    limited_news = attach_news_ids(news_items)[: routing_config["max_news_per_cycle"]]
+    if not limited_news:
+        raise ValueError("No news items remained after applying max_news_per_cycle.")
+
+    chunks = chunk_sequence(limited_news, routing_config["structuring_chunk_size"])
     structuring_schema = build_structuring_schema()
-    structuring_raw, structuring_model, structuring_attempts = generate_json_with_routing(
-        structuring_prompt,
-        structuring_schema,
-        route_name="batch_structuring",
-        routing_config=routing_config,
-    )
-    structured_batch = normalize_structuring_output(structuring_raw, news_items)
+
+    structured_batches: List[Dict[str, Any]] = []
+    structuring_attempts: List[Dict[str, Any]] = []
+    structuring_raw_payloads: List[Dict[str, Any]] = []
+    structuring_models_used: List[str] = []
+
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        chunk_prompt = build_structuring_prompt(chunk)
+        try:
+            chunk_raw, chunk_model, chunk_attempts = generate_json_with_routing(
+                chunk_prompt,
+                structuring_schema,
+                route_name="batch_structuring",
+                routing_config=routing_config,
+            )
+            chunk_structured = normalize_structuring_output(chunk_raw, chunk)
+            chunk_structured["chunk_index"] = chunk_index
+            structured_batches.append(chunk_structured)
+            structuring_raw_payloads.append(
+                {
+                    "chunk_index": chunk_index,
+                    "generated_locally": False,
+                    "model": chunk_model,
+                    "payload": chunk_raw,
+                }
+            )
+            structuring_models_used.append(chunk_model)
+            for attempt in chunk_attempts:
+                enriched_attempt = dict(attempt)
+                enriched_attempt["chunk_index"] = chunk_index
+                structuring_attempts.append(enriched_attempt)
+        except Exception as exc:
+            fallback_batch = build_local_structuring_fallback(chunk, batch_title=f"Resumen local del lote {chunk_index}")
+            fallback_batch["chunk_index"] = chunk_index
+            structured_batches.append(fallback_batch)
+            structuring_raw_payloads.append(
+                {
+                    "chunk_index": chunk_index,
+                    "generated_locally": True,
+                    "model": "local-fallback",
+                    "payload": {"fallback_reason": str(exc)},
+                }
+            )
+            structuring_models_used.append("local-fallback")
+            structuring_attempts.append(
+                {
+                    "model_name": "local-fallback",
+                    "route_name": "batch_structuring",
+                    "error": None,
+                    "chunk_index": chunk_index,
+                    "fallback_reason": str(exc),
+                }
+            )
+
+    structured_batch = _aggregate_structured_batches(structured_batches)
 
     commentary_prompt = build_market_commentary_prompt(structured_batch["items"])
     commentary_schema = build_market_commentary_schema()
@@ -845,19 +1094,27 @@ def process_news_batch(news_items: Sequence[Dict[str, Any]], config: AIProcessin
                 "model_name": "local-fallback",
                 "route_name": commentary_route_name,
                 "error": None,
+                "fallback_reason": str(exc),
             }
         )
 
-    models_used: List[str] = [structuring_model]
+    models_used: List[str] = []
+    for model_name in structuring_models_used:
+        if model_name not in models_used:
+            models_used.append(model_name)
     if commentary_model and commentary_model not in models_used:
         models_used.append(commentary_model)
 
     processed_batch = {
         "meta": {
             "generated_at_iso": now_utc_iso(),
-            "batch_size": len(structured_batch["items"]),
+            "requested_batch_size": len(news_items),
+            "processed_batch_size": len(structured_batch["items"]),
+            "chunk_count": len(chunks),
+            "chunk_size": routing_config["structuring_chunk_size"],
+            "max_news_per_cycle": routing_config["max_news_per_cycle"],
             "models_used": models_used,
-            "batch_structuring_model": structuring_model,
+            "batch_structuring_models": sorted(set(structuring_models_used)),
             "market_commentary_model": commentary_model,
             "routes": {
                 "batch_structuring": structuring_attempts,
@@ -870,7 +1127,7 @@ def process_news_batch(news_items: Sequence[Dict[str, Any]], config: AIProcessin
         "global_market_impact": commentary["global_market_impact"],
         "source_news": structured_batch["source_news"],
         "raw_model_response": {
-            "batch_structuring": structuring_raw,
+            "batch_structuring": structuring_raw_payloads,
             "market_commentary": commentary_raw_payload,
         },
     }
@@ -914,6 +1171,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--model", default="gemini-2.5-flash", help="Gemini model.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Model temperature.")
     parser.add_argument("--max-output-tokens", type=int, default=8192, help="Max output tokens.")
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_STRUCTURING_CHUNK_SIZE, help="Number of news items per structuring chunk.")
+    parser.add_argument("--max-news-per-cycle", type=int, default=DEFAULT_MAX_NEWS_PER_CYCLE, help="Maximum number of news items to process in one run.")
+    parser.add_argument("--max-json-repair-attempts", type=int, default=DEFAULT_MAX_JSON_REPAIR_ATTEMPTS, help="JSON repair attempts when model output is malformed.")
     parser.add_argument("--output", default=None, help="Optional output JSON path.")
     return parser.parse_args(argv)
 
@@ -930,6 +1190,9 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
                 temperature=args.temperature,
                 max_output_tokens=args.max_output_tokens,
                 separate_market_commentary=False,
+                structuring_chunk_size=args.chunk_size,
+                max_news_per_cycle=args.max_news_per_cycle,
+                max_json_repair_attempts=args.max_json_repair_attempts,
             ),
         )
 
