@@ -754,8 +754,9 @@ async def run_extraction(
             try:
                 root_selector, preview = await wait_for_mainfeed_text(page, timeout_ms=args.wait_ms)
                 log(f"[info] feed selector used: {root_selector}")
-                log("[info] feed text preview:")
-                log(preview[:2000])
+                if args.debug:
+                    log("[info] feed text preview:")
+                    log(preview[:2000])
             except (PlaywrightTimeoutError, RuntimeError):
                 await screenshot_debug(page, debug_dir, "mainfeed_timeout")
                 await dump_mainfeed_debug(page, debug_dir)
