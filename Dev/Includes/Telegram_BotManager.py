@@ -149,7 +149,7 @@ def build_market_impact_section(processed_batch: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(build_index_lines("EUROSTOXX50", impact.get("eurostoxx50", {})))
     lines.append("")
-    lines.append(build_index_lines("S&amp;P500", impact.get("sp500", {})))
+    lines.append(build_index_lines("S&P500", impact.get("sp500", {})))
     lines.append("")
     lines.append(build_index_lines("NIKKEI225", impact.get("nikkei225", {})))
 
